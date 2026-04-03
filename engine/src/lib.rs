@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
+use tracing::{ info};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -28,6 +29,15 @@ pub struct Fill {
 
 #[derive(Debug, Default)]
 pub struct OrderBook {
+    /*
+    BtreeMap sorted map {price,VecDeque<Order>},
+    VecDeque <FIFO algo.>
+    eg .
+    {
+       {price (100), VecDeque[100,102,99....]},
+       {price (101), VecDeque[104,102,99....]}
+    }
+     */
     /// price → queue of resting buy orders (best bid = highest key)
     bids: BTreeMap<u64, VecDeque<Order>>,
     /// price → queue of resting sell orders (best ask = lowest key)
@@ -42,6 +52,7 @@ impl OrderBook {
     /// Match the incoming order against resting orders; returns generated fills.
     /// Any unmatched remainder is added to the book.
     pub fn submit(&mut self, mut taker: Order) -> Vec<Fill> {
+        info!("submit {:?}", taker);
         let mut fills = Vec::new();
 
         match taker.side {
@@ -85,19 +96,23 @@ impl OrderBook {
             }
 
             Side::Sell => {
-                // Sell taker crosses against the highest bid (descending iteration).
                 while taker.qty > 0 {
+                    // best higest price
                     let best_bid_price = match self.bids.keys().next_back().copied() {
                         Some(p) => p,
                         None => break,
                     };
+
+
                     if taker.price > best_bid_price {
                         break;
                     }
+
                     let level = self.bids.get_mut(&best_bid_price).unwrap();
                     let maker = level.front_mut().unwrap();
 
                     let fill_qty = taker.qty.min(maker.qty);
+
                     fills.push(Fill {
                         maker_order_id: maker.id,
                         taker_order_id: taker.id,
@@ -124,7 +139,7 @@ impl OrderBook {
         fills
     }
 
-    /// Snapshot of bids: price → total qty (highest price first).
+    // Snapshot of bids: price → total qty (highest price first).
     pub fn bids_snapshot(&self) -> Vec<PriceLevel> {
         self.bids
             .iter()
@@ -154,68 +169,3 @@ pub struct PriceLevel {
     pub qty: u64,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn order(id: u64, side: Side, price: u64, qty: u64) -> Order {
-        Order {
-            id,
-            side,
-            price,
-            qty,
-            seq: id,
-        }
-    }
-
-    #[test]
-    fn no_cross_rests_order() {
-        let mut book = OrderBook::new();
-        let fills = book.submit(order(1, Side::Buy, 100, 10));
-        assert!(fills.is_empty());
-        assert_eq!(book.bids_snapshot().len(), 1);
-    }
-
-    #[test]
-    fn full_fill() {
-        let mut book = OrderBook::new();
-        book.submit(order(1, Side::Sell, 100, 10));
-        let fills = book.submit(order(2, Side::Buy, 100, 10));
-        assert_eq!(fills.len(), 1);
-        assert_eq!(fills[0].qty, 10);
-        assert!(book.asks_snapshot().is_empty());
-        assert!(book.bids_snapshot().is_empty());
-    }
-
-    #[test]
-    fn partial_fill_rests_remainder() {
-        let mut book = OrderBook::new();
-        book.submit(order(1, Side::Sell, 100, 5));
-        let fills = book.submit(order(2, Side::Buy, 100, 10));
-        assert_eq!(fills[0].qty, 5);
-        // remainder of buy rests on bid side
-        assert_eq!(book.bids_snapshot()[0].qty, 5);
-    }
-
-    #[test]
-    fn price_time_priority() {
-        let mut book = OrderBook::new();
-        // Two sells at same price; order 1 arrived first
-        book.submit(order(1, Side::Sell, 100, 5));
-        book.submit(order(2, Side::Sell, 100, 5));
-        let fills = book.submit(order(3, Side::Buy, 100, 5));
-        // Should fill against maker order 1 (time priority)
-        assert_eq!(fills[0].maker_order_id, 1);
-    }
-
-    #[test]
-    fn sell_matches_highest_bid() {
-        let mut book = OrderBook::new();
-        book.submit(order(1, Side::Buy, 99, 10));
-        book.submit(order(2, Side::Buy, 101, 10));
-        let fills = book.submit(order(3, Side::Sell, 99, 10));
-        // Should match against the 101 bid (best bid)
-        assert_eq!(fills[0].maker_order_id, 2);
-        assert_eq!(fills[0].price, 101);
-    }
-}

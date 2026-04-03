@@ -35,9 +35,8 @@ const ORDERBOOK_KEY: &str = "orderbook_snapshot";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "api_server=info".into()))
-        .init();
+    dotenvy::dotenv().ok();
+    tracing_subscriber::fmt().init();
 
     let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
     let port: u16 = std::env::var("PORT")
@@ -46,6 +45,7 @@ async fn main() -> anyhow::Result<()> {
     let instance_id = port as u64;
 
     let redis_client = redis::Client::open(redis_url.as_str())?;
+
     let (fill_tx, _) = broadcast::channel::<String>(1024);
 
     let state = AppState {
@@ -83,7 +83,8 @@ async fn post_order(
     Json(req): Json<OrderRequest>,
 ) -> impl IntoResponse {
     let local = state.next_id.fetch_add(1, Ordering::Relaxed);
-    let id = (state.instance_id << 32) | local;
+    let id: u64 = (state.instance_id << 32) | local;
+    info!("order id {id}");
 
     let order = Order {
         id,
@@ -147,6 +148,7 @@ async fn get_orderbook(State(state): State<AppState>) -> impl IntoResponse {
     };
 
     let raw: Option<String> = conn.get(ORDERBOOK_KEY).await.unwrap_or(None);
+    
     let snapshot: Value = match raw {
         Some(s) => serde_json::from_str(&s).unwrap_or(json!({"bids":[],"asks":[]})),
         None => json!({"bids":[],"asks":[]}),
@@ -167,6 +169,7 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
             Ok(msg) = rx.recv() => {
                 if socket.send(Message::Text(msg.into())).await.is_err() { break; }
             }
+            
             Some(Ok(msg)) = socket.recv() => {
                 match msg {
                     Message::Close(_) => break,
@@ -198,9 +201,9 @@ async fn do_subscribe(
 
     use futures_util::StreamExt;
     let mut stream = pubsub.on_message();
-
     while let Some(msg) = stream.next().await {
         let payload: String = msg.get_payload()?;
+        info!("payload here : {payload}");
         let fill: Fill = serde_json::from_str(&payload)?;
         let envelope = serde_json::to_string(&json!({"type":"fill","data":fill}))?;
         let _ = tx.send(envelope);

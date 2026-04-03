@@ -1,128 +1,94 @@
 use anyhow::Result;
 use engine::{Order, OrderBook};
-use redis::AsyncCommands;
+use redis::{
+    AsyncCommands, FromRedisValue, RedisResult, Value,
+    streams::{StreamReadOptions, StreamReadReply},
+};
 use serde_json;
 use tracing::{error, info};
 
-const STREAM_KEY: &str = "orders";
 const GROUP_NAME: &str = "matcher-group";
 const CONSUMER_NAME: &str = "matcher-0";
 const FILLS_CHANNEL: &str = "fills";
 const ORDERBOOK_KEY: &str = "orderbook_snapshot";
+const STREAM_KEY: &str = "orders";
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "matcher=info".into()))
-        .init();
+    tracing_subscriber::fmt().init();
 
     let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
-
     let client = redis::Client::open(redis_url.as_str())?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
+    let mut conn = client.get_async_connection().await?;
 
-    // Create consumer group (ok if already exists).
-    let _: Result<(), _> = redis::cmd("XGROUP")
+    let _: RedisResult<Value> = redis::cmd("XGROUP")
         .arg("CREATE")
         .arg(STREAM_KEY)
         .arg(GROUP_NAME)
-        .arg("0") // start from the very beginning
+        .arg("0")
         .arg("MKSTREAM")
         .query_async(&mut conn)
         .await;
 
-    info!("Matcher started. Consuming from stream '{STREAM_KEY}'…");
+    info!("Matcher started");
 
     let mut book = OrderBook::new();
     let mut seq: u64 = 0;
 
     loop {
-        // Block up to 2 s waiting for new messages. ">" means "give me only
-        // messages that have not been delivered to any consumer yet."
-        let results: Vec<redis::streams::StreamReadReply> = redis::cmd("XREADGROUP")
-            .arg("GROUP")
-            .arg(GROUP_NAME)
-            .arg(CONSUMER_NAME)
-            .arg("COUNT")
-            .arg(100)
-            .arg("BLOCK")
-            .arg(2000)
-            .arg("STREAMS")
-            .arg(STREAM_KEY)
-            .arg(">")
-            .query_async(&mut conn)
-            .await
-            .unwrap_or_default();
+        let opts = StreamReadOptions::default()
+            .group(GROUP_NAME, CONSUMER_NAME)
+            .count(100)
+            .block(5000);
 
-        for stream_reply in results {
-            for stream_id in stream_reply.keys {
-                for entry in stream_id.ids {
-                    let raw = match entry.map.get("data") {
-                        Some(redis::Value::BulkString(b)) => b.clone(),
-                        _ => {
-                            error!("Unexpected entry format: {:?}", entry);
-                            continue;
-                        }
-                    };
+        let reply: StreamReadReply = match conn.xread_options(&[STREAM_KEY], &[">"], &opts).await {
+            Ok(r) => r,
+            Err(e) => {
+                error!("xread error: {e}");
+                continue;
+            }
+        };
 
-                    let payload = match std::str::from_utf8(&raw) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            error!("UTF-8 error: {e}");
-                            continue;
-                        }
-                    };
+        for stream in reply.keys {
+            for entry in stream.ids {
+                let Some(payload) = entry
+                    .map
+                    .get("data")
+                    .and_then(|v| String::from_redis_value(v).ok())
+                else {
+                    error!("no data field in {}", entry.id);
+                    let _: RedisResult<()> = conn.xack(STREAM_KEY, GROUP_NAME, &[&entry.id]).await;
+                    continue;
+                };
 
-                    let mut order: Order = match serde_json::from_str(payload) {
-                        Ok(o) => o,
-                        Err(e) => {
-                            error!("Deserialize error: {e} — payload: {payload}");
-                            let _: Result<(), _> =
-                                conn.xack(STREAM_KEY, GROUP_NAME, &[&entry.id]).await;
-                            continue;
-                        }
-                    };
+                let Ok(mut order) = serde_json::from_str::<Order>(&payload) else {
+                    error!("deserialize failed: {payload}");
+                    let _: RedisResult<()> = conn.xack(STREAM_KEY, GROUP_NAME, &[&entry.id]).await;
+                    continue;
+                };
 
-                    // Assign monotonic sequence for time-priority within a
-                    // price level. The stream ordering guarantees global FIFO
-                    // across all API instances.
-                    seq += 1;
-                    order.seq = seq;
 
-                    info!(
-                        id = order.id,
-                        side = ?order.side,
-                        price = order.price,
-                        qty = order.qty,
-                        "Processing order"
-                    );
+                seq += 1;
+                order.seq = seq;
 
-                    let fills = book.submit(order);
-
-                    for fill in &fills {
-                        info!(
-                            maker = fill.maker_order_id,
-                            taker = fill.taker_order_id,
-                            price = fill.price,
-                            qty = fill.qty,
-                            "Fill"
-                        );
-                        let fill_json = serde_json::to_string(fill)?;
-                        let _: () = conn.publish(FILLS_CHANNEL, &fill_json).await?;
-                    }
-
-                    // Write orderbook snapshot so GET /orderbook stays current.
-                    let snapshot = serde_json::json!({
-                        "bids": book.bids_snapshot(),
-                        "asks": book.asks_snapshot(),
-                    });
+                for fill in book.submit(order) {
                     let _: () = conn
-                        .set(ORDERBOOK_KEY, serde_json::to_string(&snapshot)?)
+                        .publish(FILLS_CHANNEL, serde_json::to_string(&fill)?)
                         .await?;
-
-                    // ACK: tell Redis we processed this message successfully.
-                    let _: () = conn.xack(STREAM_KEY, GROUP_NAME, &[&entry.id]).await?;
                 }
+
+                let _: () = conn
+                    .set(
+                        ORDERBOOK_KEY,
+                        serde_json::to_string(&serde_json::json!({
+                            "bids": book.bids_snapshot(),
+                            "asks": book.asks_snapshot(),
+                        }))?,
+                    )
+                    .await?;
+
+                let _: () = conn.xack(STREAM_KEY, GROUP_NAME, &[&entry.id]).await?;
+                info!("order {} seq={} acked", entry.id, seq);
             }
         }
     }
