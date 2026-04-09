@@ -67,15 +67,34 @@ async fn main() -> Result<()> {
                     continue;
                 };
 
-
                 seq += 1;
                 order.seq = seq;
 
-                for fill in book.submit(order) {
-                    let _: () = conn
-                        .publish(FILLS_CHANNEL, serde_json::to_string(&fill)?)
-                        .await?;
-                }
+                // using different thread for publising the fills  I/O opration.
+                let client_clone = client.clone();
+                let fills = book.submit(order);
+                tokio::spawn(async move {
+                    info!(" fills {:?}",fills);
+                    let mut conn = match client_clone.get_async_connection().await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            error!("Publich redis conn error ,{:?}", e);
+                            return;
+                        }
+                    };
+                    for fill in fills {
+                        let msg = match serde_json::to_string(&fill) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                error!("Serialization error ,{:?}", e);
+                                continue;
+                            }
+                        };
+                        if let Err(e) = conn.publish::<_, _, ()>(FILLS_CHANNEL, msg).await {
+                            error!("Fill Publish error {:?}", e)
+                        }
+                    }
+                });
 
                 let _: () = conn
                     .set(

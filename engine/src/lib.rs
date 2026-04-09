@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
-use tracing::{ info};
+use tracing::info;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -103,7 +103,6 @@ impl OrderBook {
                         None => break,
                     };
 
-
                     if taker.price > best_bid_price {
                         break;
                     }
@@ -168,4 +167,3 @@ pub struct PriceLevel {
     pub price: u64,
     pub qty: u64,
 }
-

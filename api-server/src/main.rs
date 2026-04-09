@@ -86,6 +86,14 @@ async fn post_order(
     let id: u64 = (state.instance_id << 32) | local;
     info!("order id {id}");
 
+    if req.qty <= 0 {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"qty":"shold be grater then 0"})),
+        )
+            .into_response();
+    }
+
     let order = Order {
         id,
         side: req.side,
@@ -148,7 +156,7 @@ async fn get_orderbook(State(state): State<AppState>) -> impl IntoResponse {
     };
 
     let raw: Option<String> = conn.get(ORDERBOOK_KEY).await.unwrap_or(None);
-    
+
     let snapshot: Value = match raw {
         Some(s) => serde_json::from_str(&s).unwrap_or(json!({"bids":[],"asks":[]})),
         None => json!({"bids":[],"asks":[]}),
@@ -169,7 +177,7 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
             Ok(msg) = rx.recv() => {
                 if socket.send(Message::Text(msg.into())).await.is_err() { break; }
             }
-            
+
             Some(Ok(msg)) = socket.recv() => {
                 match msg {
                     Message::Close(_) => break,
